@@ -129,6 +129,8 @@ typedef struct InputFilterPriv {
 
     int width, height;
     AVRational sample_aspect_ratio;
+    enum AVColorSpace color_space;
+    enum AVColorRange color_range;
 
     int sample_rate;
     AVChannelLayout ch_layout;
@@ -149,6 +151,8 @@ typedef struct InputFilterPriv {
         int                 width;
         int                 height;
         AVRational          sample_aspect_ratio;
+        enum AVColorSpace   color_space;
+        enum AVColorRange   color_range;
 
         int                 sample_rate;
         AVChannelLayout     ch_layout;
@@ -260,6 +264,8 @@ static int sub2video_get_blank_frame(InputFilterPriv *ifp)
     frame->width  = ifp->width;
     frame->height = ifp->height;
     frame->format = ifp->format;
+    frame->colorspace = ifp->color_space;
+    frame->color_range = ifp->color_range;
 
     ret = av_frame_get_buffer(frame, 0);
     if (ret < 0)
@@ -836,6 +842,8 @@ static InputFilter *ifilter_alloc(FilterGraph *fg)
     ifp->index           = fg->nb_inputs - 1;
     ifp->format          = -1;
     ifp->fallback.format = -1;
+    ifp->color_space = ifp->fallback.color_space = AVCOL_SPC_UNSPECIFIED;
+    ifp->color_range = ifp->fallback.color_range = AVCOL_RANGE_UNSPECIFIED;
 
     ifp->frame_queue = av_fifo_alloc2(8, sizeof(AVFrame*), AV_FIFO_FLAG_AUTO_GROW);
     if (!ifp->frame_queue)
@@ -1465,11 +1473,8 @@ static int configure_input_video_filter(FilterGraph *fg, AVFilterGraph *graph,
     int ret, pad_idx = 0;
     int64_t tsoffset = 0;
     AVBufferSrcParameters *par = av_buffersrc_parameters_alloc();
-
     if (!par)
         return AVERROR(ENOMEM);
-    memset(par, 0, sizeof(*par));
-    par->format = AV_PIX_FMT_NONE;
 
     if (ist->dec_ctx->codec_type == AVMEDIA_TYPE_AUDIO) {
         av_log(fg, AV_LOG_ERROR, "Cannot connect video filter to audio input\n");
@@ -1492,9 +1497,11 @@ static int configure_input_video_filter(FilterGraph *fg, AVFilterGraph *graph,
     av_bprint_init(&args, 0, AV_BPRINT_SIZE_AUTOMATIC);
     av_bprintf(&args,
              "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:"
-             "pixel_aspect=%d/%d",
+             "pixel_aspect=%d/%d:colorspace=%s:range=%s",
              ifp->width, ifp->height, ifp->format,
-             ifp->time_base.num, ifp->time_base.den, sar.num, sar.den);
+             ifp->time_base.num, ifp->time_base.den, sar.num, sar.den,
+             av_color_space_name(ifp->color_space),
+             av_color_range_name(ifp->color_range));
     if (fr.num && fr.den)
         av_bprintf(&args, ":frame_rate=%d/%d", fr.num, fr.den);
     snprintf(name, sizeof(name), "graph %d input from stream %d:%d", fg->index,
@@ -1839,6 +1846,8 @@ int ifilter_parameters_from_dec(InputFilter *ifilter, const AVCodecContext *dec)
         ifp->fallback.width                  = dec->width;
         ifp->fallback.height                 = dec->height;
         ifp->fallback.sample_aspect_ratio    = dec->sample_aspect_ratio;
+        ifp->fallback.color_space            = dec->colorspace;
+        ifp->fallback.color_range            = dec->color_range;
     } else if (dec->codec_type == AVMEDIA_TYPE_AUDIO) {
         int ret;
 
@@ -1879,6 +1888,8 @@ static int ifilter_parameters_from_frame(InputFilter *ifilter, const AVFrame *fr
     ifp->width               = frame->width;
     ifp->height              = frame->height;
     ifp->sample_aspect_ratio = frame->sample_aspect_ratio;
+    ifp->color_space         = frame->colorspace;
+    ifp->color_range         = frame->color_range;
 
     ifp->sample_rate         = frame->sample_rate;
     ret = av_channel_layout_copy(&ifp->ch_layout, &frame->ch_layout);
@@ -2017,9 +2028,9 @@ static int choose_out_timebase(OutputFilterPriv *ofp, AVFrame *frame)
     if (!(tb.num > 0 && tb.den > 0))
         tb = frame->time_base;
 
+    fps->framerate     = fr;
 finish:
     ofp->tb_out        = tb;
-    fps->framerate     = fr;
     ofp->tb_out_locked = 1;
 
     return 0;
@@ -2104,8 +2115,11 @@ static void video_sync_process(OutputFilterPriv *ofp, AVFrame *frame,
 
     if (delta0 < 0 &&
         delta > 0 &&
-        ost->vsync_method != VSYNC_PASSTHROUGH &&
-        ost->vsync_method != VSYNC_DROP) {
+        ost->vsync_method != VSYNC_PASSTHROUGH
+#if FFMPEG_OPT_VSYNC_DROP
+        && ost->vsync_method != VSYNC_DROP
+#endif
+        ) {
         if (delta0 < -0.6) {
             av_log(ost, AV_LOG_VERBOSE, "Past duration %f too large\n", -delta0);
         } else
@@ -2143,7 +2157,9 @@ static void video_sync_process(OutputFilterPriv *ofp, AVFrame *frame,
             ofp->next_pts = llrint(sync_ipts);
         frame->duration = llrint(duration);
         break;
+#if FFMPEG_OPT_VSYNC_DROP
     case VSYNC_DROP:
+#endif
     case VSYNC_PASSTHROUGH:
         ofp->next_pts = llrint(sync_ipts);
         frame->duration = llrint(duration);
@@ -2454,7 +2470,7 @@ static int read_frames(FilterGraph *fg, FilterGraphThread *fgt,
             }
         }
         did_step = 1;
-    };
+    }
 
     return (fgp->nb_outputs_done == fg->nb_outputs) ? AVERROR_EOF : 0;
 }
@@ -2554,6 +2570,8 @@ static int send_eof(FilterGraphThread *fgt, InputFilter *ifilter,
             ifp->width                  = ifp->fallback.width;
             ifp->height                 = ifp->fallback.height;
             ifp->sample_aspect_ratio    = ifp->fallback.sample_aspect_ratio;
+            ifp->color_space            = ifp->fallback.color_space;
+            ifp->color_range            = ifp->fallback.color_range;
 
             ret = av_channel_layout_copy(&ifp->ch_layout,
                                          &ifp->fallback.ch_layout);
@@ -2580,41 +2598,57 @@ static int send_eof(FilterGraphThread *fgt, InputFilter *ifilter,
     return 0;
 }
 
+enum ReinitReason {
+    VIDEO_CHANGED   = (1 << 0),
+    AUDIO_CHANGED   = (1 << 1),
+    MATRIX_CHANGED  = (1 << 2),
+    HWACCEL_CHANGED = (1 << 3)
+};
+
+static const char *unknown_if_null(const char *str)
+{
+    return str ? str : "unknown";
+}
+
 static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
                       InputFilter *ifilter, AVFrame *frame)
 {
     InputFilterPriv *ifp = ifp_from_ifilter(ifilter);
     FrameData       *fd;
     AVFrameSideData *sd;
-    int need_reinit, ret;
+    int need_reinit = 0, ret;
 
     /* determine if the parameters for this input changed */
-    need_reinit = ifp->format != frame->format;
-
     switch (ifp->type) {
     case AVMEDIA_TYPE_AUDIO:
-        need_reinit |= ifp->sample_rate    != frame->sample_rate ||
-                       av_channel_layout_compare(&ifp->ch_layout, &frame->ch_layout);
+        if (ifp->format      != frame->format ||
+            ifp->sample_rate != frame->sample_rate ||
+            av_channel_layout_compare(&ifp->ch_layout, &frame->ch_layout))
+            need_reinit |= AUDIO_CHANGED;
         break;
     case AVMEDIA_TYPE_VIDEO:
-        need_reinit |= ifp->width  != frame->width ||
-                       ifp->height != frame->height;
+        if (ifp->format != frame->format ||
+            ifp->width  != frame->width ||
+            ifp->height != frame->height ||
+            ifp->color_space != frame->colorspace ||
+            ifp->color_range != frame->color_range)
+            need_reinit |= VIDEO_CHANGED;
         break;
     }
+
+    if (sd = av_frame_get_side_data(frame, AV_FRAME_DATA_DISPLAYMATRIX)) {
+        if (!ifp->displaymatrix_present ||
+            memcmp(sd->data, ifp->displaymatrix, sizeof(ifp->displaymatrix)))
+            need_reinit |= MATRIX_CHANGED;
+    } else if (ifp->displaymatrix_present)
+        need_reinit |= MATRIX_CHANGED;
 
     if (!ifp->ist->reinit_filters && fgt->graph)
         need_reinit = 0;
 
     if (!!ifp->hw_frames_ctx != !!frame->hw_frames_ctx ||
         (ifp->hw_frames_ctx && ifp->hw_frames_ctx->data != frame->hw_frames_ctx->data))
-        need_reinit = 1;
-
-    if (sd = av_frame_get_side_data(frame, AV_FRAME_DATA_DISPLAYMATRIX)) {
-        if (!ifp->displaymatrix_present ||
-            memcmp(sd->data, ifp->displaymatrix, sizeof(ifp->displaymatrix)))
-            need_reinit = 1;
-    } else if (ifp->displaymatrix_present)
-        need_reinit = 1;
+        need_reinit |= HWACCEL_CHANGED;
 
     if (need_reinit) {
         ret = ifilter_parameters_from_frame(ifilter, frame);
@@ -2643,6 +2677,32 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
         av_frame_free(&tmp);
         if (ret < 0)
             return ret;
+
+        if (fgt->graph) {
+            AVBPrint reason;
+            av_bprint_init(&reason, 0, AV_BPRINT_SIZE_AUTOMATIC);
+            if (need_reinit & AUDIO_CHANGED) {
+                const char *sample_format_name = av_get_sample_fmt_name(frame->format);
+                av_bprintf(&reason, "audio parameters changed to %d Hz, ", frame->sample_rate);
+                av_channel_layout_describe_bprint(&frame->ch_layout, &reason);
+                av_bprintf(&reason, ", %s, ", unknown_if_null(sample_format_name));
+            }
+            if (need_reinit & VIDEO_CHANGED) {
+                const char *pixel_format_name = av_get_pix_fmt_name(frame->format);
+                const char *color_space_name = av_color_space_name(frame->colorspace);
+                const char *color_range_name = av_color_range_name(frame->color_range);
+                av_bprintf(&reason, "video parameters changed to %s(%s, %s), %dx%d, ",
+                        unknown_if_null(pixel_format_name), unknown_if_null(color_range_name),
+                        unknown_if_null(color_space_name), frame->width, frame->height);
+            }
+            if (need_reinit & MATRIX_CHANGED)
+                av_bprintf(&reason, "display matrix changed, ");
+            if (need_reinit & HWACCEL_CHANGED)
+                av_bprintf(&reason, "hwaccel changed, ");
+            if (reason.len > 1)
+                reason.str[reason.len - 2] = '\0'; // remove last comma
+            av_log(fg, AV_LOG_INFO, "Reconfiguring filter graph%s%s\n", reason.len ? " because " : "", reason.str);
+        }
 
         ret = configure_filtergraph(fg, fgt);
         if (ret < 0) {
@@ -2830,7 +2890,7 @@ read_frames:
     for (unsigned i = 0; i < fg->nb_outputs; i++) {
         OutputFilterPriv *ofp = ofp_from_ofilter(fg->outputs[i]);
 
-        if (fgt.eof_out[i])
+        if (fgt.eof_out[i] || !fgt.graph)
             continue;
 
         ret = fg_output_frame(ofp, &fgt, NULL);
